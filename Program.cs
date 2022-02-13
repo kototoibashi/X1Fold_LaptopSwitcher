@@ -3,19 +3,31 @@ using ModeSwitcher.Utilities;
 using System;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Reactive;
+using System.Reactive.Linq;
+using System.Runtime.InteropServices;
 
 namespace X1Fold_LaptopSwitcher
 {
     internal class Program
     {
-        const int PollingInterval = 1000;
-        static object _objSyncDock = new object();
+        const int PollingInterval = 5000;
+        static readonly object lockObj = new object();
+        private static readonly CancellationTokenSource cancelationTokenSource = new CancellationTokenSource();
+        private static readonly EventWaitHandle programEndWaitHandle = new EventWaitHandle(false,EventResetMode.ManualReset);
 
-        static void Main(string[] args)
+        [DllImport("kernel32.dll")]
+        private static extern bool FreeConsole();
+
+        public static void Main(string[] args)
         {
+            cancelationTokenSource.Token.Register(() => programEndWaitHandle.Set());
+            Console.CancelKeyPress += Console_CancelKeyPress;
+
             var parseResult = Parser.Default.ParseArguments<Options>(args);
             Options opt = null;
 
+            Task task = null;
 
             switch (parseResult.Tag)
             {
@@ -26,114 +38,125 @@ namespace X1Fold_LaptopSwitcher
 
 
                     opt = parsed.Value;
+                    if (!opt.Verbose)
+                    {
+                        FreeConsole();
+                    }
 
-                    if (opt.ChangeToLaptopView) { SetScreenToDockDisplay(); }
-                    else if (opt.ChangeToHorizontalView) { SetScreenToUndockDisplay(false); }
-                    else if (opt.ChangeToVerticalView) { SetScreenToUndockDisplay(true); }
-                    else if (opt.Auto) { StartAutoDisplayMode(); }
+                    if (opt.ChangeToLaptopView) { 
+                        DeviceEmbeddedDisplay.SetScreenToDockDisplay();
+                        OSRegistry.DisableAutoRotation();
+                    }
+                    else if (opt.ChangeToHorizontalView) { 
+                        DeviceEmbeddedDisplay.SetScreenToUndockDisplay();
+                        DeviceEmbeddedDisplay.Rotate(3);
+                    }
+                    else if (opt.ChangeToVerticalView) { 
+                        DeviceEmbeddedDisplay.SetScreenToUndockDisplay();
+                        DeviceEmbeddedDisplay.Rotate(0);
+                    }
+                    else if (opt.Auto) { task = StartAutoDisplayMode(); }
+                    else { task = StartAutoDisplayMode(); }
+
+
 
 
                     break;
-
                 case ParserResultType.NotParsed:
 
                     var notParsed = parseResult as NotParsed<Options>;
 
                     break;
             }
+
+
+            task?.Wait();
         }
 
-        static void SetScreenToDockDisplay()
+        private static void Console_CancelKeyPress(object sender, ConsoleCancelEventArgs e)
         {
-            OSRegistry.DisableAutoRotation();
-            Win32.NativeMethods.ChangeResoToKeyboardDockedResolution();
+            cancelationTokenSource?.Cancel();
         }
 
-        static void SetScreenToUndockDisplay(bool vertical = false)
-        {
-            const int device_width = 2048;
-            const int device_height = 1536;
+        static async Task StartAutoDisplayMode() {
 
-            var width = vertical ? device_width : device_height;
-            var height = vertical ? device_height : device_width;
-
-
-            uint num = Win32.NativeMethods.ChangeResolution(width, height);
-            int num2 = 0;
-            while (num != 0 && num2 < 2)
+            using(var dockWatcher = new DockWatcher())
+            using(var osWatcher = new EventHandlerOS())
             {
-                num = Win32.NativeMethods.ChangeResolution(width, height);
-                Thread.Sleep(100);
-                num2++;
-            }
+                
+                var osWakeUpEvent = osWatcher
+                        .Where(x =>x == WindowOSEvents.OS_DisplayOn)
+                        .Select(x => GetCurrentDockState());
 
+                var osEvent = osWatcher
+                    .Where(x =>
+                        x == WindowOSEvents.OS_DisplaySettingsChanged
+                        || x == WindowOSEvents.OS_UserPreferenceChanged
+                        || x == WindowOSEvents.OS_DisplayOff
+                        || x == WindowOSEvents.OS_SessionEnd
+                        || x == WindowOSEvents.OS_SessionSwitch
+                        || x == WindowOSEvents.OS_PowerModeChanged
+                    )
+                    .Sample(TimeSpan.FromMilliseconds(100))
+                    .Select(x => GetCurrentDockState());
 
-            OSRegistry.EnableAutoRotation();
-        }
+                var TimerEvent = Observable.Timer(TimeSpan.FromSeconds(0),TimeSpan.FromMilliseconds(200)).Take(10).Select(x => GetCurrentDockState());
 
-        static void StartAutoDisplayMode() {
+                var stateChangeEvent = 
+                    TimerEvent.Merge(dockWatcher).Merge(osEvent)
+                    .Sample(TimeSpan.FromMilliseconds(300))
+                    .DistinctUntilChanged()
+                    .Merge(osWakeUpEvent)
+                    .Sample(TimeSpan.FromMilliseconds(50));
 
-            // Dockイベントハンドラ初期化
-            StartDockThread();
+                stateChangeEvent.Subscribe((dockState) => {
+                    if (dockState == 1)
+                    {
+                        Console.WriteLine("Set to laptop mode");
+                        OSRegistry.DisableAutoRotation();
+                        DeviceEmbeddedDisplay.Rotate(0);
+                        DeviceEmbeddedDisplay.SetScreenToDockDisplay();
+                    }
+                    else
+                    {
+                        Console.WriteLine("Set to tablet mode");
+                        DeviceEmbeddedDisplay.SetScreenToUndockDisplay();
+                        OSRegistry.EnableAutoRotation();
+                    }
+                });
 
-            var pastDockState = Win32.NativeMethods.GetDeviceDockState(isFromModeSwitcher: true);
-            while (true) {
-                Thread.Sleep(PollingInterval);
-
-                // 定期的に確認する
-                var currentDockState = Win32.NativeMethods.GetDeviceDockState(isFromModeSwitcher: true);
-                if (pastDockState != currentDockState)
+                while (!cancelationTokenSource.Token.IsCancellationRequested)
                 {
-                    Task.Run(() => AutoModeChangeWorker());
-                }
-                pastDockState = currentDockState;
-            }
-        }
-
-        public static void StartDockThread()
-        {
-            Task task = null;
-            lock (_objSyncDock)
-            {
-                try
-                {
-                    Win32.dockDelegate = CallbackDockChanged;
-                    task = Task.Run(() =>{
-                        Win32.NativeMethods.DeviceDock(Win32.dockDelegate);
-                    });
-                }
-                catch
-                {
-                    Console.Error.WriteLine("DockChanged Thread FAILED!");
-                    return;
+                    Thread.Sleep(1000);
+                    programEndWaitHandle.WaitOne();
                 }
             }
         }
 
-        private static void CallbackDockChanged(int dockInterruptState)
-        {
-            Console.WriteLine($"Dock Changed: {dockInterruptState}");
-            Task.Run(() => StartDockThread());
-            AutoModeChangeWorker();
-        }
 
-        static int AutoModeChangeWorker()
+        static int AutoModeChange()
         {
             var currentDockState = Win32.NativeMethods.GetDeviceDockState(isFromModeSwitcher: true);
 
             if (currentDockState == 1)
             {
                 Console.WriteLine("Set to laptop mode");
-                SetScreenToDockDisplay();
+                DeviceEmbeddedDisplay.SetScreenToDockDisplay();
             }
             else
             {
                 Console.WriteLine("Set to undock mode");
-                SetScreenToUndockDisplay();
+                DeviceEmbeddedDisplay.SetScreenToUndockDisplay();
             }
 
             return currentDockState;
         }
+
+        static int GetCurrentDockState()
+        {
+            return Win32.NativeMethods.GetDeviceDockState(isFromModeSwitcher: true);
+        }
+
     }
 
     enum DisplayMode
@@ -143,7 +166,6 @@ namespace X1Fold_LaptopSwitcher
 
     internal class Options
     {
-        // -a と -aaa の二つ指定可能
         [Option('l', "laptop", Required = false, HelpText = "Change to Laptop mode")]
         public bool ChangeToLaptopView { get; set; }
         [Option('h',"horizontal", Required = false)]
@@ -152,6 +174,8 @@ namespace X1Fold_LaptopSwitcher
         public bool ChangeToVerticalView { get; set; }
         [Option('a', "auto", Required = false)]
         public bool Auto { get; set; }
+        [Option("verbose", Required = false)]
+        public bool Verbose { get; set; }
     }
 
 
