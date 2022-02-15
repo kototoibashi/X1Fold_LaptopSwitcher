@@ -57,7 +57,7 @@ namespace X1Fold_LaptopSwitcher
         {
             foreach (var observer in observers)
             {
-                Task.Run(() => observer.OnNext(dockInterruptState));
+                observer.OnNext(dockInterruptState);
             }
         }
 

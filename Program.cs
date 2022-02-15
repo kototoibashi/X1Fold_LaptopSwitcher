@@ -3,9 +3,9 @@ using ModeSwitcher.Utilities;
 using System;
 using System.Threading;
 using System.Threading.Tasks;
-using System.Reactive;
 using System.Reactive.Linq;
 using System.Runtime.InteropServices;
+using System.Management;
 
 namespace X1Fold_LaptopSwitcher
 {
@@ -43,16 +43,15 @@ namespace X1Fold_LaptopSwitcher
                         FreeConsole();
                     }
 
-                    if (opt.ChangeToLaptopView) { 
-                        DeviceEmbeddedDisplay.SetScreenToDockDisplay();
-                        OSRegistry.DisableAutoRotation();
+                    if (opt.ChangeToLaptopView) {
+                        DockModeChange(1);
                     }
-                    else if (opt.ChangeToHorizontalView) { 
-                        DeviceEmbeddedDisplay.SetScreenToUndockDisplay();
+                    else if (opt.ChangeToHorizontalView) {
+                        DockModeChange(0);
                         DeviceEmbeddedDisplay.Rotate(3);
                     }
-                    else if (opt.ChangeToVerticalView) { 
-                        DeviceEmbeddedDisplay.SetScreenToUndockDisplay();
+                    else if (opt.ChangeToVerticalView) {
+                        DockModeChange(0);
                         DeviceEmbeddedDisplay.Rotate(0);
                     }
                     else if (opt.Auto) { task = StartAutoDisplayMode(); }
@@ -83,11 +82,14 @@ namespace X1Fold_LaptopSwitcher
             using(var dockWatcher = new DockWatcher())
             using(var osWatcher = new EventHandlerOS())
             {
-                
-                var osWakeUpEvent = osWatcher
-                        .Where(x =>x == WindowOSEvents.OS_DisplayOn)
-                        .Select(x => GetCurrentDockState());
+                // キーボード着脱イベント
+                var dockEvent = (IObservable<int>)dockWatcher;
 
+                // 初回起動イベント
+                var initializeEvent = Observable.Timer(TimeSpan.FromMilliseconds(200))
+                    .Select(x => GetCurrentDockState());
+
+                // OSのさまざまなイベント
                 var osEvent = osWatcher
                     .Where(x =>
                         x == WindowOSEvents.OS_DisplaySettingsChanged
@@ -97,64 +99,114 @@ namespace X1Fold_LaptopSwitcher
                         || x == WindowOSEvents.OS_SessionSwitch
                         || x == WindowOSEvents.OS_PowerModeChanged
                     )
-                    .Sample(TimeSpan.FromMilliseconds(100))
+                    .Sample(TimeSpan.FromMilliseconds(500))
                     .Select(x => GetCurrentDockState());
 
-                var TimerEvent = Observable.Timer(TimeSpan.FromSeconds(0),TimeSpan.FromMilliseconds(200)).Take(10).Select(x => GetCurrentDockState());
-
+                // 切り替えが頻繁に発生しないよう500ms間隔で間引く
                 var stateChangeEvent = 
-                    TimerEvent.Merge(dockWatcher).Merge(osEvent)
-                    .Sample(TimeSpan.FromMilliseconds(300))
-                    .DistinctUntilChanged()
-                    .Merge(osWakeUpEvent)
-                    .Sample(TimeSpan.FromMilliseconds(50));
+                    dockEvent.Merge(osEvent)
+                    .Sample(TimeSpan.FromMilliseconds(500))
+                    .DistinctUntilChanged();
 
-                stateChangeEvent.Subscribe((dockState) => {
-                    if (dockState == 1)
-                    {
-                        Console.WriteLine("Set to laptop mode");
-                        OSRegistry.DisableAutoRotation();
-                        DeviceEmbeddedDisplay.Rotate(0);
-                        DeviceEmbeddedDisplay.SetScreenToDockDisplay();
-                    }
-                    else
-                    {
-                        Console.WriteLine("Set to tablet mode");
-                        DeviceEmbeddedDisplay.SetScreenToUndockDisplay();
-                        OSRegistry.EnableAutoRotation();
-                    }
+                // OSイベントとキーボード着脱イベントで実行する
+                stateChangeEvent.Subscribe(async (dockState) => {
+                    // 画面輝度を取得
+                    var brightness = GetBrightness();
+
+                    // モードチェンジ中は暗転させる
+                    SetBrightness(brightness == 0 ? 1 : 0);
+
+                    // モードチェンジ
+                    await DockModeChange(dockState);
+
+                    // 輝度を戻す
+                    SetBrightness(brightness);
                 });
 
+                // スリープ復帰イベント
+                var osWakeUpEvent = osWatcher
+                        .Where(x => x == WindowOSEvents.OS_DisplayOn)
+                        .Select(x => GetCurrentDockState());
+
+                // スリープ復帰時に実行する
+                osWakeUpEvent.Merge(initializeEvent).Subscribe(async (dockState) =>
+                {
+                    // 画面輝度を取得
+                    var brightness = GetBrightness();
+
+                    // モードチェンジ中は暗転させる
+                    SetBrightness(brightness == 0 ? 1 : 0);
+
+                    // なぜか1回ではうまくいかないので、何度か繰り返す
+                    for (var i = 0; i < 6; i++)
+                    {
+                        var invertedDockState = dockState == 1 ? 0 : 1;
+                        await DockModeChange(invertedDockState);
+                        await Task.Delay(1);
+                        await DockModeChange(dockState);
+                        await Task.Delay(1);
+                    }
+
+                    // 画面輝度を戻す
+                    SetBrightness(brightness);
+                });
+
+                // キャンセルされるまで待つ
                 while (!cancelationTokenSource.Token.IsCancellationRequested)
                 {
-                    Thread.Sleep(1000);
+                    await Task.Delay(10000,cancelationTokenSource.Token);
                     programEndWaitHandle.WaitOne();
                 }
             }
         }
 
-
-        static int AutoModeChange()
+        static Task DockModeChange(int dockState)
         {
-            var currentDockState = Win32.NativeMethods.GetDeviceDockState(isFromModeSwitcher: true);
-
-            if (currentDockState == 1)
+            return Task.Run(() =>
             {
-                Console.WriteLine("Set to laptop mode");
-                DeviceEmbeddedDisplay.SetScreenToDockDisplay();
-            }
-            else
-            {
-                Console.WriteLine("Set to undock mode");
-                DeviceEmbeddedDisplay.SetScreenToUndockDisplay();
-            }
 
-            return currentDockState;
+                if (dockState == 1)
+                {
+                    Console.WriteLine("Set to laptop mode");
+                    OSRegistry.DisableAutoRotation();
+                    DeviceEmbeddedDisplay.Rotate(0);
+                    DeviceEmbeddedDisplay.SetScreenToDockDisplay();
+                }
+                else
+                {
+                    Console.WriteLine("Set to tablet mode");
+                    DeviceEmbeddedDisplay.SetScreenToUndockDisplay();
+                    OSRegistry.EnableAutoRotation();
+                }
+            });
         }
 
         static int GetCurrentDockState()
         {
             return Win32.NativeMethods.GetDeviceDockState(isFromModeSwitcher: true);
+        }
+
+        static int GetBrightness()
+        {
+            var brightness = 100;
+            var WmiMonitorBrightness = new ManagementClass("root/wmi", "WmiMonitorBrightness", null);
+            foreach (ManagementObject mo in WmiMonitorBrightness.GetInstances())
+            {
+                return int.Parse(mo["CurrentBrightness"].ToString());
+            }
+            return brightness;
+        }
+
+        static void SetBrightness(int brightness)
+        {
+            var WmiMonitorBrightnessMethod = new ManagementClass("root/wmi", "WmiMonitorBrightnessMethods", null);
+            foreach (ManagementObject mo in WmiMonitorBrightnessMethod.GetInstances())
+            {
+                var x = mo.GetMethodParameters("WmiSetBrightness");
+                x["Brightness"] = brightness;
+                x["Timeout"] = 5;
+                mo.InvokeMethod("WmiSetBrightness", x, null);
+            }
         }
 
     }

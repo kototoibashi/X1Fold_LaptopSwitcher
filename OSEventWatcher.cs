@@ -95,7 +95,7 @@ namespace X1Fold_LaptopSwitcher
 		{
 			foreach (var observer in observers)
 			{
-				Task.Run(() => observer.OnNext(e.OSEvent));
+				observer.OnNext(e.OSEvent);
 			}
 		}
 
