@@ -3,6 +3,8 @@ name: MSBuild
 on:
   pull_request:
     types: [synchronize, opened]
+  push:
+    branches: [ master ]
     
 jobs:
   build:
