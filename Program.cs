@@ -6,6 +6,8 @@ using System.Threading.Tasks;
 using System.Reactive.Linq;
 using System.Runtime.InteropServices;
 using System.Management;
+using System.IO;
+using System.Net;
 
 namespace X1Fold_LaptopSwitcher
 {
@@ -25,56 +27,41 @@ namespace X1Fold_LaptopSwitcher
             Console.CancelKeyPress += Console_CancelKeyPress;
 
             var parseResult = Parser.Default.ParseArguments<Options>(args);
-            Options opt = null;
 
-            Task task = null;
-
-            switch (parseResult.Tag)
-            {
-
-                case ParserResultType.Parsed:
-
-                    var parsed = parseResult as Parsed<Options>;
-
-
-                    opt = parsed.Value;
-                    if (!opt.Verbose)
-                    {
-                        FreeConsole();
-                    }
-
-                    if (opt.ChangeToLaptopView) {
-                        DockModeChange(1);
-                    }
-                    else if (opt.ChangeToHorizontalView) {
-                        DockModeChange(0);
-                        DeviceEmbeddedDisplay.Rotate(3);
-                    }
-                    else if (opt.ChangeToVerticalView) {
-                        DockModeChange(0);
-                        DeviceEmbeddedDisplay.Rotate(0);
-                    }
-                    else if (opt.Auto) { task = StartAutoDisplayMode(); }
-                    else { task = StartAutoDisplayMode(); }
-
-
-
-
-                    break;
-                case ParserResultType.NotParsed:
-
-                    var notParsed = parseResult as NotParsed<Options>;
-
-                    break;
+            if (parseResult.Tag != ParserResultType.Parsed) {
+                Console.Error.WriteLine("Commandline option error");
+                return;
             }
 
+            var parsed = parseResult as Parsed<Options>;
+            var opt = parsed.Value;
+            Task task = null;
+
+            CheckModeLibDllExists();
+
+            if (!opt.Verbose)
+            {
+                FreeConsole();
+            }
+
+            if (opt.ChangeToLaptopView)
+            {
+                DockModeChange(1);
+            }
+            else if (opt.ChangeToHorizontalView)
+            {
+                DockModeChange(0);
+                DeviceEmbeddedDisplay.Rotate(3);
+            }
+            else if (opt.ChangeToVerticalView)
+            {
+                DockModeChange(0);
+                DeviceEmbeddedDisplay.Rotate(0);
+            }
+            else if (opt.Auto) { task = StartAutoDisplayMode(); }
+            else { task = StartAutoDisplayMode(); }
 
             task?.Wait();
-        }
-
-        private static void Console_CancelKeyPress(object sender, ConsoleCancelEventArgs e)
-        {
-            cancelationTokenSource?.Cancel();
         }
 
         static async Task StartAutoDisplayMode() {
@@ -82,12 +69,10 @@ namespace X1Fold_LaptopSwitcher
             using(var dockWatcher = new DockWatcher())
             using(var osWatcher = new EventHandlerOS())
             {
+                var semaphore = new SemaphoreSlim(0, 1);
+
                 // キーボード着脱イベント
                 var dockEvent = (IObservable<int>)dockWatcher;
-
-                // 初回起動イベント
-                var initializeEvent = Observable.Timer(TimeSpan.FromMilliseconds(200))
-                    .Select(x => GetCurrentDockState());
 
                 // OSのさまざまなイベント
                 var osEvent = osWatcher
@@ -109,47 +94,66 @@ namespace X1Fold_LaptopSwitcher
                     .DistinctUntilChanged();
 
                 // OSイベントとキーボード着脱イベントで実行する
-                stateChangeEvent.Subscribe(async (dockState) => {
-                    // 画面輝度を取得
-                    var brightness = GetBrightness();
+                stateChangeEvent.Subscribe(async (dockState) =>
+                {
+                    try
+                    {
+                        await semaphore.WaitAsync();
 
-                    // モードチェンジ中は暗転させる
-                    SetBrightness(brightness == 0 ? 1 : 0);
+                        // 画面輝度を取得
+                        var brightness = GetBrightness();
 
-                    // モードチェンジ
-                    await DockModeChange(dockState);
+                        // モードチェンジ中は暗転させる
+                        SetBrightness(brightness == 0 ? 1 : 0);
 
-                    // 輝度を戻す
-                    SetBrightness(brightness);
-                });
+                        // モードチェンジ
+                        await DockModeChange(dockState);
 
+                        // モードチェンジすると輝度が勝手に変わるので、戻す
+                        SetBrightness(brightness);
+                    }
+                    finally { semaphore.Release(); }
+                }
+                );
+                
                 // スリープ復帰イベント
                 var osWakeUpEvent = osWatcher
                         .Where(x => x == WindowOSEvents.OS_DisplayOn)
                         .Select(x => GetCurrentDockState());
 
+                // 初回起動イベント
+                var initializeEvent = Observable.Timer(TimeSpan.FromMilliseconds(200))
+                    .Select(x => GetCurrentDockState());
+
                 // スリープ復帰時に実行する
                 osWakeUpEvent.Merge(initializeEvent).Subscribe(async (dockState) =>
                 {
-                    // 画面輝度を取得
-                    var brightness = GetBrightness();
-
-                    // モードチェンジ中は暗転させる
-                    SetBrightness(brightness == 0 ? 1 : 0);
-
-                    // なぜか1回ではうまくいかないので、何度か繰り返す
-                    for (var i = 0; i < 6; i++)
+                    try
                     {
-                        var invertedDockState = dockState == 1 ? 0 : 1;
-                        await DockModeChange(invertedDockState);
-                        await Task.Delay(1);
-                        await DockModeChange(dockState);
-                        await Task.Delay(1);
-                    }
+                        await semaphore.WaitAsync();
 
-                    // 画面輝度を戻す
-                    SetBrightness(brightness);
-                });
+                        // 画面輝度を取得
+                        var brightness = GetBrightness();
+
+                        // モードチェンジ中は暗転させる
+                        SetBrightness(brightness == 0 ? 1 : 0);
+
+                        // なぜか1回ではうまくいかないので、何度か繰り返す
+                        for (var i = 0; i < 6; i++)
+                        {
+                            var invertedDockState = dockState == 1 ? 0 : 1;
+                            await DockModeChange(invertedDockState);
+                            await Task.Delay(1);
+                            await DockModeChange(dockState);
+                            await Task.Delay(1);
+                        }
+
+                        // モードチェンジすると輝度が勝手に変わるので、戻す
+                        SetBrightness(brightness);
+                    }
+                    finally { semaphore.Release(); }
+                }
+                );
 
                 // キャンセルされるまで待つ
                 while (!cancelationTokenSource.Token.IsCancellationRequested)
@@ -157,6 +161,9 @@ namespace X1Fold_LaptopSwitcher
                     await Task.Delay(10000,cancelationTokenSource.Token);
                     programEndWaitHandle.WaitOne();
                 }
+
+                // タブレットモードにしてから終了する
+                await DockModeChange(0);
             }
         }
 
@@ -184,6 +191,46 @@ namespace X1Fold_LaptopSwitcher
         static int GetCurrentDockState()
         {
             return Win32.NativeMethods.GetDeviceDockState(isFromModeSwitcher: true);
+        }
+
+        private static bool CheckModeLibDllExists()
+        {
+            const string dll_url = @"https://github.com/kototoibashi/X1Fold_LaptopSwitcher/releases/download/v0.0.2/ModeLib.dll";
+            const string lenovo_dll_path = @"C:\Program Files\Lenovo\Mode Switcher\ModeLib.dll";
+            var dll_path = Path.Combine(Path.GetDirectoryName(System.Reflection.Assembly.GetEntryAssembly().Location), "ModeLib.dll");
+
+            if (File.Exists(dll_path)) return true;
+
+            try {
+                Win32.NativeMethods.GetDeviceDockState(isFromModeSwitcher: true);
+
+                // DLL OK
+                return true;
+            } 
+            catch (DllNotFoundException ex)
+            {
+                Console.Error.WriteLine("ModeLib.DLL NOT FOUND!");
+                // DLL not found
+                if (File.Exists(lenovo_dll_path))
+                {
+                    // Copy from Lenovo Mode Switcher
+                    Console.Error.WriteLine("Copy ModeLib.dll");
+                    File.Copy(lenovo_dll_path, Path.Combine(lenovo_dll_path, dll_path));
+                    return true;
+                }
+                else {
+                    // Download dll
+                    Console.Error.WriteLine("Download ModeLib.dll");
+                    var mywebClient = new WebClient();
+                    mywebClient.DownloadFile(dll_url, dll_path);
+                    return true;
+                }
+            }
+        }
+
+        private static void Console_CancelKeyPress(object sender, ConsoleCancelEventArgs e)
+        {
+            cancelationTokenSource?.Cancel();
         }
 
         static int GetBrightness()
@@ -218,14 +265,18 @@ namespace X1Fold_LaptopSwitcher
 
     internal class Options
     {
+        [Option('a', "auto", Required = false, HelpText = "Auto mode")]
+        public bool Auto { get; set; } = true;
+
         [Option('l', "laptop", Required = false, HelpText = "Change to Laptop mode")]
         public bool ChangeToLaptopView { get; set; }
-        [Option('h',"horizontal", Required = false)]
+
+        [Option('h',"horizontal", Required = false, HelpText = "Change to Horizontal view")]
         public bool ChangeToHorizontalView { get; set; }
-        [Option('v', "vertical", Required = false)]
+
+        [Option('v', "vertical", Required = false, HelpText = "Change to Vertical view")]
         public bool ChangeToVerticalView { get; set; }
-        [Option('a', "auto", Required = false)]
-        public bool Auto { get; set; }
+
         [Option("verbose", Required = false)]
         public bool Verbose { get; set; }
     }
