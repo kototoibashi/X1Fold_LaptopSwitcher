@@ -15,16 +15,23 @@ jobs:
 
       - name: Add msbuild to PATH
         uses: microsoft/setup-msbuild@v1.0.2
-
+        
       - run: |
           msbuild -version
+        
+      - name: Setup Nuget.exe
+        uses: warrenbuckley/Setup-Nuget@v1
+          
+      - name: nuget restore
+        run: nuget restore X1Fold_LaptopSwitcher.sln
+        shell: cmd
           
       - name: MSBuild
-        run: msbuild X1Fold_LaptopSwitcher.sln -p:OutDir="out/"
+        run: msbuild X1Fold_LaptopSwitcher.sln -p:OutDir="out/";Configuration=Release;Platform="x64"
         shell: cmd
 
       - name: Upload artifact
         uses: actions/upload-artifact@v1
         with:
           name: build-result
-          path: ./msbuild_actions_sample/out/
+          path: ./laptopswitcher/out/
