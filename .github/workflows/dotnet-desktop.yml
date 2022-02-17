@@ -6,7 +6,7 @@ on:
     
 jobs:
   build:
-    runs-on: windows-2019
+    runs-on: windows-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v2
@@ -18,7 +18,7 @@ jobs:
           msbuild -version
           
       - name: MSBuild
-        run: msbuild msbuild_actions_sample.sln -p:OutDir="out/"
+        run: msbuild X1Fold_LaptopSwitcher.sln -p:OutDir="out/"
         shell: cmd
 
       - name: Upload artifact
