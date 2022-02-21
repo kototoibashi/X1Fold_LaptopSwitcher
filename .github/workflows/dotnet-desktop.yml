@@ -19,9 +19,6 @@ jobs:
       - run: |
           msbuild -version
         
-      - name: Setup Nuget.exe
-        uses: warrenbuckley/Setup-Nuget@v1
-          
       - name: nuget restore
         run: nuget restore X1Fold_LaptopSwitcher.sln
         shell: cmd
